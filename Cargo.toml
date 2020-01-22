@@ -1,0 +1,33 @@
+[package]
+name = "gst-plugin-custom-compositor"
+version = "0.1.0"
+authors = ["Sebastian Dröge <sebastian@centricular.com>"]
+license = "MIT"
+edition = "2018"
+description = "Custom Compositor Plugin"
+repository = "https://gstreamer.freedesktop.org"
+
+[dependencies]
+libc = "0.2"
+glib = "0.9"
+glib-sys = "0.9"
+gobject-sys = "0.9"
+gstreamer = { version = "0.15.1", features = ["v1_14"] }
+gstreamer-base = { version = "0.15", features = ["v1_16"], optional = true }
+gstreamer-sys = { version = "0.8" }
+gstreamer-video = { version = "0.15", features = ["v1_14"] }
+once_cell = "1.0"
+
+[lib]
+name = "gstcustomcompositor"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[build-dependencies]
+gst-plugin-version-helper = "0.1"
+cc = "1.0"
+pkg-config = "0.3"
+
+[features]
+default = []
+#v1_18 = ["gstreamer/v1_18", "gstreamer-base"]
