@@ -292,7 +292,7 @@ impl CustomCompositor {
                 if let Some(current) = current_frame {
                     // Time out old frames if there was no new one for more than a second,
                     // otherwise continue using it
-                    if current.end_time <= time + gst::SECOND {
+                    if current.end_time + gst::SECOND <= time {
                         gst_debug!(
                             CAT,
                             obj: pad,
