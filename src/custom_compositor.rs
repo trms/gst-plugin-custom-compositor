@@ -804,32 +804,39 @@ impl AggregatorImpl for CustomCompositor {
             outbuf.set_duration(end_time - time);
         }
 
-        let mut out_frame =
-            gst_video::VideoFrame::from_buffer_writable(outbuf, &state.info).unwrap();
+        // If we don't have any pads left at this point and don't need to draw the background then
+        // we can simply pass through the input buffer of the first pad with modified pts/duration
+        // as above. This prevents a copy of all memories below when mapping the buffer writable.
+        if !pads.is_empty() || needs_background {
+            let mut out_frame =
+                gst_video::VideoFrame::from_buffer_writable(outbuf, &state.info).unwrap();
 
-        // TODO: If we didn't simply copy the first pad's buffer, check if one of the
-        // pads completely covers the output. If not, initialize the output with black
-        if needs_background {
-            let width = out_frame.width() as usize;
-            let stride = out_frame.plane_stride()[0] as usize;
-            for line in out_frame
-                .plane_data_mut(0)
-                .unwrap()
-                .chunks_exact_mut(stride)
-            {
-                for pixel in line[0..(2 * width)].chunks_exact_mut(2) {
-                    pixel[0] = 128;
-                    pixel[1] = 0;
+            // TODO: If we didn't simply copy the first pad's buffer, check if one of the
+            // pads completely covers the output. If not, initialize the output with black
+            if needs_background {
+                let width = out_frame.width() as usize;
+                let stride = out_frame.plane_stride()[0] as usize;
+                for line in out_frame
+                    .plane_data_mut(0)
+                    .unwrap()
+                    .chunks_exact_mut(stride)
+                {
+                    for pixel in line[0..(2 * width)].chunks_exact_mut(2) {
+                        pixel[0] = 128;
+                        pixel[1] = 0;
+                    }
                 }
             }
-        }
 
-        self.composite(&pads, &mut out_frame)?;
+            self.composite(&pads, &mut out_frame)?;
+
+            outbuf = out_frame.into_buffer();
+        }
 
         state.num_frames += 1;
         drop(state_guard);
 
-        agg.finish_buffer(out_frame.into_buffer())
+        agg.finish_buffer(outbuf)
     }
 
     fn sink_event(
