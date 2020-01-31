@@ -222,6 +222,7 @@ impl CustomCompositor {
 
                 PadCurrentFrame {
                     frame,
+                    converted_frame: None,
                     start_time: running_time,
                     end_time: running_time_end,
                 }
@@ -338,6 +339,101 @@ impl CustomCompositor {
         }
     }
 
+    fn convert_frames(&self, pads: &[gst_base::AggregatorPad]) -> Result<(), gst::FlowError> {
+        for pad in pads {
+            let imp = CustomCompositorPad::from_instance(pad);
+            let settings = imp.settings.lock().unwrap().clone();
+            let mut state_guard = imp.state.lock().unwrap();
+
+            let PadState {
+                ref mut current_frame,
+                ..
+            } = state_guard.as_mut().unwrap();
+
+            let current_frame = match current_frame {
+                Some(frame) => frame,
+                None => continue,
+            };
+
+            // If no conversion is needed (width/height are matching), just get rid of a potential
+            // converted frame from a previous run. Otherwise scale.
+            if (settings.width == 0 || settings.width == current_frame.frame.width() as i32)
+                || (settings.height == 0 || settings.height == current_frame.frame.height() as i32)
+            {
+                let _ = current_frame.converted_frame.take();
+                continue;
+            }
+
+            let target_width = if settings.width == 0 {
+                current_frame.frame.width()
+            } else {
+                settings.width as u32
+            };
+            let target_height = if settings.height == 0 {
+                current_frame.frame.height()
+            } else {
+                settings.height as u32
+            };
+
+            // Check if we already converted before to the same resolution
+            if let Some(ref converted_frame) = current_frame.converted_frame {
+                if converted_frame.width() == target_width
+                    && converted_frame.height() == target_height
+                {
+                    continue;
+                }
+            }
+
+            let current_info = current_frame.frame.info();
+            let target_info =
+                gst_video::VideoInfo::new(current_info.format(), target_width, target_height)
+                    .interlace_mode(current_info.interlace_mode())
+                    .flags(current_info.flags())
+                    .views(current_info.views())
+                    .chroma_site(current_info.chroma_site())
+                    .colorimetry(&current_info.colorimetry())
+                    .par(current_info.par())
+                    .fps(current_info.fps())
+                    .multiview_mode(current_info.multiview_mode())
+                    .multiview_flags(current_info.multiview_flags())
+                    .field_order(current_info.field_order())
+                    .build()
+                    .unwrap();
+
+            gst_debug!(
+                CAT,
+                obj: pad,
+                "Converting frame from {}x{} to {}x{}",
+                current_info.width(),
+                current_info.height(),
+                target_width,
+                target_height
+            );
+
+            let converter = gst_video::VideoConverter::new(&current_info, &target_info, None)
+                .map_err(|_| {
+                    gst_error!(CAT, obj: pad, "Can't create converter");
+                    gst::FlowError::NotNegotiated
+                })?;
+
+            let converted_buf = gst::Buffer::with_size(target_info.size()).map_err(|_| {
+                gst_error!(CAT, obj: pad, "Can't allocate converted buffer");
+                gst::FlowError::NotNegotiated
+            })?;
+
+            let mut converted_frame =
+                gst_video::VideoFrame::from_buffer_writable(converted_buf, &target_info).unwrap();
+            converter.frame(&current_frame.frame, &mut converted_frame);
+            let converted_buf = converted_frame.into_buffer();
+
+            current_frame.converted_frame = Some(
+                gst_video::VideoFrame::from_buffer_readable(converted_buf, &target_info).unwrap(),
+            );
+        }
+
+        Ok(())
+    }
+
     fn composite(
         &self,
         pads: &[gst_base::AggregatorPad],
@@ -362,7 +458,6 @@ impl CustomCompositor {
             }
 
             let PadState {
-                ref info,
                 ref mut current_frame,
                 ..
             } = state_guard.as_mut().unwrap();
@@ -372,10 +467,15 @@ impl CustomCompositor {
                 Some(frame) => frame,
             };
 
+            let vframe = current_frame
+                .converted_frame
+                .as_ref()
+                .unwrap_or(&current_frame.frame);
+
             // Calculate output frame start position and input frame start position based on the
             // xpos configuration and the frame sizes
             let start_col =
-                if settings.xpos < 0 && settings.xpos.abs() as u64 >= info.width() as u64 {
+                if settings.xpos < 0 && settings.xpos.abs() as u64 >= vframe.width() as u64 {
                     // Nothing to copy, completely outside the output frame
                     gst_debug!(CAT, obj: pad, "Skipping fully invisible pad");
                     continue;
@@ -394,7 +494,7 @@ impl CustomCompositor {
                 };
 
             let start_row =
-                if settings.ypos < 0 && settings.ypos.abs() as u64 >= info.height() as u64 {
+                if settings.ypos < 0 && settings.ypos.abs() as u64 >= vframe.height() as u64 {
                     // Nothing to copy, completely outside the output frame
                     gst_debug!(CAT, obj: pad, "Skipping fully invisible pad");
                     continue;
@@ -411,10 +511,12 @@ impl CustomCompositor {
                 };
 
             // Calculate the number of rows to copy overall
-            let copy_cols =
-                std::cmp::min(info.width() as usize - start_col.1, out_width - start_col.0);
+            let copy_cols = std::cmp::min(
+                vframe.width() as usize - start_col.1,
+                out_width - start_col.0,
+            );
             let copy_rows = std::cmp::min(
-                info.height() as usize - start_row.1,
+                vframe.height() as usize - start_row.1,
                 out_height - start_row.0,
             );
 
@@ -428,13 +530,13 @@ impl CustomCompositor {
                 (start_row.0, start_col.0)
             );
 
-            let in_stride = current_frame.frame.plane_stride()[0] as usize;
+            let in_stride = vframe.plane_stride()[0] as usize;
 
             let out_data = &mut out_frame.plane_data_mut(0).unwrap()
                 [start_row.0 * out_stride + 2 * start_col.0..];
-            if info.format() == gst_video::VideoFormat::Uyvy {
-                let in_data = &current_frame.frame.plane_data(0).unwrap()
-                    [start_row.1 * in_stride + 2 * start_col.1..];
+            if vframe.format() == gst_video::VideoFormat::Uyvy {
+                let in_data =
+                    &vframe.plane_data(0).unwrap()[start_row.1 * in_stride + 2 * start_col.1..];
 
                 composite_uyvy(
                     settings.alpha,
@@ -445,9 +547,9 @@ impl CustomCompositor {
                     copy_rows,
                     copy_cols,
                 );
-            } else if info.format() == gst_video::VideoFormat::Ayuv {
-                let in_data = &current_frame.frame.plane_data(0).unwrap()
-                    [start_row.1 * in_stride + 4 * start_col.1..];
+            } else if vframe.format() == gst_video::VideoFormat::Ayuv {
+                let in_data =
+                    &vframe.plane_data(0).unwrap()[start_row.1 * in_stride + 4 * start_col.1..];
                 composite_ayuv(
                     settings.alpha,
                     out_data,
@@ -759,6 +861,8 @@ impl AggregatorImpl for CustomCompositor {
         // Note: pads[0] is the bottom pad, pads[last] is the top one
         self.fill_queues(&pads, timeout, time, end_time)?;
 
+        self.convert_frames(&pads)?;
+
         // Check if we can use the first pad's buffer as background
         let first_pad_buffer = pads.get(0).and_then(|first_pad| {
             let imp = CustomCompositorPad::from_instance(first_pad);
@@ -771,6 +875,8 @@ impl AggregatorImpl for CustomCompositor {
                     && pad_state.info.format() == state.info.format()
                     && pad_settings.xpos == 0
                     && pad_settings.ypos == 0
+                    && pad_settings.width == 0
+                    && pad_settings.height == 0
                     && pad_settings.alpha == 1.0
                     && pad_state.current_frame.is_some()
                 {
@@ -949,7 +1055,7 @@ impl AggregatorImpl for CustomCompositor {
     }
 }
 
-static PAD_PROPERTIES: [subclass::Property; 4] = [
+static PAD_PROPERTIES: [subclass::Property; 6] = [
     subclass::Property("zorder", |name| {
         glib::ParamSpec::uint(
             name,
@@ -983,6 +1089,28 @@ static PAD_PROPERTIES: [subclass::Property; 4] = [
             glib::ParamFlags::READWRITE,
         )
     }),
+    subclass::Property("width", |name| {
+        glib::ParamSpec::int(
+            name,
+            "Width",
+            "Width of the picture",
+            std::i32::MIN,
+            std::i32::MAX,
+            0,
+            glib::ParamFlags::READWRITE,
+        )
+    }),
+    subclass::Property("height", |name| {
+        glib::ParamSpec::int(
+            name,
+            "Height",
+            "Height of the picture",
+            std::i32::MIN,
+            std::i32::MAX,
+            0,
+            glib::ParamFlags::READWRITE,
+        )
+    }),
     subclass::Property("alpha", |name| {
         glib::ParamSpec::double(
             name,
@@ -998,6 +1126,7 @@ static PAD_PROPERTIES: [subclass::Property; 4] = [
 
 struct PadCurrentFrame {
     frame: gst_video::VideoFrame<gst_video::video_frame::Readable>,
+    converted_frame: Option<gst_video::VideoFrame<gst_video::video_frame::Readable>>,
     start_time: gst::ClockTime,
     end_time: gst::ClockTime,
 }
@@ -1012,6 +1141,8 @@ struct PadSettings {
     zorder: u32,
     xpos: i32,
     ypos: i32,
+    width: i32,
+    height: i32,
     alpha: f64,
 }
 
@@ -1021,6 +1152,8 @@ impl Default for PadSettings {
             zorder: 0,
             xpos: 0,
             ypos: 0,
+            width: 0,
+            height: 0,
             alpha: 1.0,
         }
     }
@@ -1097,6 +1230,30 @@ impl ObjectImpl for CustomCompositorPad {
                 );
                 settings.ypos = ypos;
             }
+            subclass::Property("width", ..) => {
+                let mut settings = self.settings.lock().unwrap();
+                let width = value.get_some().expect("type checked upstream");
+                gst_info!(
+                    CAT,
+                    obj: pad,
+                    "Changing width from {} to {}",
+                    settings.width,
+                    width,
+                );
+                settings.width = width;
+            }
+            subclass::Property("height", ..) => {
+                let mut settings = self.settings.lock().unwrap();
+                let height = value.get_some().expect("type checked upstream");
+                gst_info!(
+                    CAT,
+                    obj: pad,
+                    "Changing height from {} to {}",
+                    settings.height,
+                    height,
+                );
+                settings.height = height;
+            }
             subclass::Property("alpha", ..) => {
                 let mut settings = self.settings.lock().unwrap();
                 let alpha = value.get_some().expect("type checked upstream");
@@ -1128,6 +1285,14 @@ impl ObjectImpl for CustomCompositorPad {
             subclass::Property("ypos", ..) => {
                 let settings = self.settings.lock().unwrap();
                 Ok(settings.ypos.to_value())
+            }
+            subclass::Property("width", ..) => {
+                let settings = self.settings.lock().unwrap();
+                Ok(settings.width.to_value())
+            }
+            subclass::Property("height", ..) => {
+                let settings = self.settings.lock().unwrap();
+                Ok(settings.height.to_value())
             }
             subclass::Property("alpha", ..) => {
                 let settings = self.settings.lock().unwrap();
