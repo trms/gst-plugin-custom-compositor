@@ -985,7 +985,7 @@ impl AggregatorImpl for CustomCompositor {
             .unwrap();
         let templ_caps = srcpad.get_pad_template_caps().unwrap();
 
-        let caps = srcpad
+        let mut caps = srcpad
             .peer_query_caps(Some(&templ_caps))
             .unwrap_or(templ_caps);
 
@@ -994,7 +994,7 @@ impl AggregatorImpl for CustomCompositor {
             return false;
         }
 
-        let mut caps = gst::Caps::truncate(caps);
+        caps.truncate();
         {
             let caps = caps.make_mut();
             let s = caps.get_mut_structure(0).unwrap();
@@ -1006,7 +1006,7 @@ impl AggregatorImpl for CustomCompositor {
             }
             s.fixate_field_nearest_fraction("framerate", gst::Fraction::new(25, 1));
         }
-        let caps = gst::Caps::fixate(caps);
+        caps.fixate();
 
         let mut state = self.state.lock().unwrap();
 
