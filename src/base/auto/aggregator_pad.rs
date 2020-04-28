@@ -10,10 +10,6 @@ use glib::signal::SignalHandlerId;
 use glib::translate::*;
 use glib::StaticType;
 use glib::Value;
-use glib_sys;
-use gobject_sys;
-use gst;
-use gst_sys;
 use std::boxed::Box as Box_;
 use std::mem::transmute;
 
@@ -138,7 +134,7 @@ impl<O: IsA<AggregatorPad>> AggregatorPadExt for O {
         {
             let f: &F = &*(f as *const F);
             f(
-                &AggregatorPad::from_glib_borrow(this).unsafe_cast(),
+                &AggregatorPad::from_glib_borrow(this).unsafe_cast_ref(),
                 &from_glib_borrow(object),
             )
         }
@@ -165,7 +161,7 @@ impl<O: IsA<AggregatorPad>> AggregatorPadExt for O {
             P: IsA<AggregatorPad>,
         {
             let f: &F = &*(f as *const F);
-            f(&AggregatorPad::from_glib_borrow(this).unsafe_cast())
+            f(&AggregatorPad::from_glib_borrow(this).unsafe_cast_ref())
         }
         unsafe {
             let f: Box_<F> = Box_::new(f);

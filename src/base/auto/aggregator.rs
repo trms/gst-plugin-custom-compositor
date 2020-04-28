@@ -10,9 +10,6 @@ use glib::signal::SignalHandlerId;
 use glib::translate::*;
 use glib::StaticType;
 use glib::Value;
-use glib_sys;
-use gobject_sys;
-use gst;
 use std::boxed::Box as Box_;
 use std::mem::transmute;
 
@@ -30,6 +27,8 @@ unsafe impl Sync for Aggregator {}
 pub const NONE_AGGREGATOR: Option<&Aggregator> = None;
 
 pub trait AggregatorExt: 'static {
+    //fn get_allocator(&self, allocator: /*Ignored*/gst::Allocator, params: /*Ignored*/gst::AllocationParams);
+
     fn get_buffer_pool(&self) -> Option<gst::BufferPool>;
 
     fn get_latency(&self) -> gst::ClockTime;
@@ -142,7 +141,7 @@ impl<O: IsA<Aggregator>> AggregatorExt for O {
             P: IsA<Aggregator>,
         {
             let f: &F = &*(f as *const F);
-            f(&Aggregator::from_glib_borrow(this).unsafe_cast())
+            f(&Aggregator::from_glib_borrow(this).unsafe_cast_ref())
         }
         unsafe {
             let f: Box_<F> = Box_::new(f);
@@ -167,7 +166,7 @@ impl<O: IsA<Aggregator>> AggregatorExt for O {
             P: IsA<Aggregator>,
         {
             let f: &F = &*(f as *const F);
-            f(&Aggregator::from_glib_borrow(this).unsafe_cast())
+            f(&Aggregator::from_glib_borrow(this).unsafe_cast_ref())
         }
         unsafe {
             let f: Box_<F> = Box_::new(f);

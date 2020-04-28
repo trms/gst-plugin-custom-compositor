@@ -7,11 +7,8 @@
 // except according to those terms.
 
 use super::super::gst_base_sys;
-use glib_sys;
-use gst_sys;
 
 use glib::translate::*;
-use gst;
 
 use glib::subclass::prelude::*;
 use gst::subclass::prelude::*;
@@ -120,7 +117,7 @@ where
 {
     let instance = &*(ptr as *mut T::Instance);
     let imp = instance.get_impl();
-    let wrap: AggregatorPad = from_glib_borrow(ptr);
+    let wrap: Borrowed<AggregatorPad> = from_glib_borrow(ptr);
 
     let res: gst::FlowReturn = imp.flush(&wrap, &from_glib_borrow(aggregator)).into();
     res.to_glib()
@@ -136,7 +133,7 @@ where
 {
     let instance = &*(ptr as *mut T::Instance);
     let imp = instance.get_impl();
-    let wrap: AggregatorPad = from_glib_borrow(ptr);
+    let wrap: Borrowed<AggregatorPad> = from_glib_borrow(ptr);
 
     imp.skip_buffer(
         &wrap,
