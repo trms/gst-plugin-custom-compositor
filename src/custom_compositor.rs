@@ -210,7 +210,12 @@ impl CustomCompositor {
                 ..
             } = state_guard.as_mut().unwrap();
 
-            let next_frame = pad.peek_buffer().map(|b| {
+            let next_frame = pad.peek_buffer().and_then(|b| {
+                // Gap buffers
+                if b.get_size() == 0 {
+                    pad.drop_buffer();
+                    return None;
+                }
                 let pts = b.get_pts();
                 let duration = b.get_duration();
                 assert!(pts.is_some());
@@ -220,12 +225,12 @@ impl CustomCompositor {
                 let running_time_end = segment.to_running_time(pts + duration);
                 let frame = gst_video::VideoFrame::from_buffer_readable(b, info).unwrap();
 
-                PadCurrentFrame {
+                Some(PadCurrentFrame {
                     frame,
                     converted_frame: None,
                     start_time: running_time,
                     end_time: running_time_end,
-                }
+                })
             });
 
             if !pad.is_eos() {
@@ -328,7 +333,7 @@ impl CustomCompositor {
             }
         }
 
-        gst_debug!(CAT, obj: &self.get_instance(), "Need waiting {}, all eos {}", need_wait, all_eos);
+        gst_debug!(CAT, obj: &self.get_instance(), "Need waiting {}, timeout {}, all eos {}", need_wait, timeout, all_eos);
 
         if need_wait && !timeout {
             Err(gst_base::AGGREGATOR_FLOW_NEED_DATA)
