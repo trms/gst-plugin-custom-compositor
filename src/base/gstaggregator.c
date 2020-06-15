@@ -115,7 +115,7 @@ gst_aggregator_start_time_selection_get_type (void)
     };
 
     gtype =
-        g_enum_register_static ("GstAggregatorFallbackStartTimeSelection",
+        g_enum_register_static ("GstAggregatorCustomCompositorStartTimeSelection",
         values);
   }
   return gtype;
@@ -2717,7 +2717,7 @@ gst_aggregator_get_type (void)
     };
 
     _type = g_type_register_static (GST_TYPE_ELEMENT,
-        "GstAggregatorFallback", &info, G_TYPE_FLAG_ABSTRACT);
+        "GstAggregatorCustomCompositor", &info, G_TYPE_FLAG_ABSTRACT);
 
     aggregator_private_offset =
         g_type_add_instance_private (_type, sizeof (GstAggregatorPrivate));
