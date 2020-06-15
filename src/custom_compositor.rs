@@ -607,7 +607,7 @@ impl ObjectSubclass for CustomCompositor {
                 ),
             )
             .build();
-        let src_pad_template = gst::PadTemplate::new_with_gtype(
+        let src_pad_template = gst::PadTemplate::with_gtype(
             "src",
             gst::PadDirection::Src,
             gst::PadPresence::Always,
@@ -629,7 +629,7 @@ impl ObjectSubclass for CustomCompositor {
                 ),
             )
             .build();
-        let sink_pad_template = gst::PadTemplate::new_with_gtype(
+        let sink_pad_template = gst::PadTemplate::with_gtype(
             "sink_%u",
             gst::PadDirection::Sink,
             gst::PadPresence::Request,
