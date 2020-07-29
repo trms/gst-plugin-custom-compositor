@@ -391,7 +391,7 @@ impl CustomCompositor {
 
             let current_info = current_frame.frame.info();
             let target_info =
-                gst_video::VideoInfo::new(current_info.format(), target_width, target_height)
+                gst_video::VideoInfo::builder(current_info.format(), target_width, target_height)
                     .interlace_mode(current_info.interlace_mode())
                     .flags(current_info.flags())
                     .views(current_info.views())
