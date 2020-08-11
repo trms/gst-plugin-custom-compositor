@@ -863,6 +863,17 @@ impl AggregatorImpl for CustomCompositor {
         // Note: pads[0] is the bottom pad, pads[last] is the top one
         self.fill_queues(&pads, timeout, time, end_time)?;
 
+        drop(state_guard);
+
+        agg.selected_samples(time, gst::CLOCK_TIME_NONE, end_time - time, None);
+
+        let mut state_guard = self.state.lock().unwrap();
+
+        let state = match &mut *state_guard {
+            None => return Err(gst::FlowError::NotNegotiated),
+            Some(ref mut state) => state,
+        };
+
         self.convert_frames(&pads)?;
 
         // Check if we can use the first pad's buffer as background
@@ -1054,6 +1065,44 @@ impl AggregatorImpl for CustomCompositor {
         );
 
         true
+    }
+
+    fn peek_next_sample(
+        &self,
+        _aggregator: &gst_base::Aggregator,
+        pad: &gst_base::AggregatorPad,
+    ) -> Option<gst::Sample> {
+        let imp = CustomCompositorPad::from_instance(pad);
+
+        let mut state_guard = imp.state.lock().unwrap();
+        if state_guard.is_none() {
+            return None;
+        }
+
+        let PadState {
+            ref mut current_frame,
+            ..
+        } = state_guard.as_mut().unwrap();
+
+        let current_frame = match current_frame {
+            None => {
+                return None;
+            }
+            Some(frame) => frame,
+        };
+
+        let vframe = current_frame
+            .converted_frame
+            .as_ref()
+            .unwrap_or(&current_frame.frame);
+
+        Some(
+            gst::Sample::builder()
+                .buffer(&vframe.buffer_owned())
+                .caps(&vframe.info().to_caps().unwrap())
+                .segment(&pad.get_segment())
+                .build(),
+        )
     }
 }
 
