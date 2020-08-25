@@ -188,6 +188,7 @@ impl CustomCompositor {
 
         for pad in pads {
             let imp = CustomCompositorPad::from_instance(pad);
+            let settings = imp.settings.lock().unwrap().clone();
             let mut state_guard = imp.state.lock().unwrap();
             if state_guard.is_none() {
                 continue;
@@ -227,6 +228,7 @@ impl CustomCompositor {
                     converted_frame: None,
                     start_time: running_time,
                     end_time: running_time_end,
+                    is_repeat: false,
                 })
             });
 
@@ -294,8 +296,10 @@ impl CustomCompositor {
             } else {
                 if let Some(current) = current_frame {
                     // Time out old frames if there was no new one for more than a second,
-                    // otherwise continue using it
-                    if current.end_time + gst::SECOND <= time {
+                    // otherwise continue using it. When a pad is marked to repeat black
+                    // on EOS, we substitute the current frame with a black one, which
+                    // we never time out (is_repeat = true).
+                    if !current.is_repeat && current.end_time + gst::SECOND <= time {
                         gst_debug!(
                             CAT,
                             obj: pad,
@@ -303,13 +307,46 @@ impl CustomCompositor {
                             current.start_time,
                             current.end_time
                         );
-                        *current_frame = None;
 
                         if !pad.is_eos() {
                             gst_debug!(CAT, obj: pad, "Waiting for more data");
+                            *current_frame = None;
                             need_wait = true;
+                        } else if settings.repeat_black_on_eos {
+                            let info = gst_video::VideoInfo::builder(
+                                gst_video::VideoFormat::Uyvy,
+                                current.frame.info().width(),
+                                current.frame.info().height(),
+                            )
+                            .build()
+                            .unwrap();
+                            let b = gst::Buffer::with_size(info.size()).unwrap();
+                            let mut frame =
+                                gst_video::VideoFrame::from_buffer_writable(b, &info).unwrap();
+                            let width = frame.width() as usize;
+                            let stride = frame.plane_stride()[0] as usize;
+                            for line in frame.plane_data_mut(0).unwrap().chunks_exact_mut(stride) {
+                                for pixel in line[0..(2 * width)].chunks_exact_mut(2) {
+                                    pixel[0] = 128;
+                                    pixel[1] = 0;
+                                }
+                            }
+                            *current_frame = Some(PadCurrentFrame {
+                                frame: gst_video::VideoFrame::from_buffer_readable(
+                                    frame.into_buffer(),
+                                    &info,
+                                )
+                                .unwrap(),
+                                converted_frame: None,
+                                start_time: gst::CLOCK_TIME_NONE,
+                                end_time: gst::CLOCK_TIME_NONE,
+                                is_repeat: true,
+                            });
+
+                            gst_debug!(CAT, obj: pad, "Back in black");
                         } else {
                             gst_debug!(CAT, obj: pad, "Pad is fully EOS now");
+                            *current_frame = None;
                         }
                     } else if pad.is_eos() {
                         gst_trace!(
@@ -319,7 +356,7 @@ impl CustomCompositor {
                             current.start_time,
                             current.end_time
                         );
-                        if current.end_time >= time {
+                        if !current.is_repeat && current.end_time >= time {
                             all_eos = false;
                         }
                     }
@@ -1106,7 +1143,7 @@ impl AggregatorImpl for CustomCompositor {
     }
 }
 
-static PAD_PROPERTIES: [subclass::Property; 6] = [
+static PAD_PROPERTIES: [subclass::Property; 7] = [
     subclass::Property("zorder", |name| {
         glib::ParamSpec::uint(
             name,
@@ -1173,6 +1210,15 @@ static PAD_PROPERTIES: [subclass::Property; 6] = [
             glib::ParamFlags::READWRITE,
         )
     }),
+    subclass::Property("repeat-black-on-eos", |name| {
+        glib::ParamSpec::boolean(
+            name,
+            "Repeat black on EOS",
+            "Whether the pad should repeat black frames on EOS until removed",
+            false,
+            glib::ParamFlags::READWRITE,
+        )
+    }),
 ];
 
 struct PadCurrentFrame {
@@ -1180,6 +1226,7 @@ struct PadCurrentFrame {
     converted_frame: Option<gst_video::VideoFrame<gst_video::video_frame::Readable>>,
     start_time: gst::ClockTime,
     end_time: gst::ClockTime,
+    is_repeat: bool,
 }
 
 struct PadState {
@@ -1195,6 +1242,7 @@ struct PadSettings {
     width: i32,
     height: i32,
     alpha: f64,
+    repeat_black_on_eos: bool,
 }
 
 impl Default for PadSettings {
@@ -1206,6 +1254,7 @@ impl Default for PadSettings {
             width: 0,
             height: 0,
             alpha: 1.0,
+            repeat_black_on_eos: false,
         }
     }
 }
@@ -1317,6 +1366,18 @@ impl ObjectImpl for CustomCompositorPad {
                 );
                 settings.alpha = alpha;
             }
+            subclass::Property("repeat-black-on-eos", ..) => {
+                let mut settings = self.settings.lock().unwrap();
+                let repeat = value.get_some().expect("type checked upstream");
+                gst_info!(
+                    CAT,
+                    obj: pad,
+                    "Changing repeat black on EOS from {} to {}",
+                    settings.repeat_black_on_eos,
+                    repeat,
+                );
+                settings.repeat_black_on_eos = repeat;
+            }
             _ => unimplemented!(),
         }
     }
@@ -1348,6 +1409,10 @@ impl ObjectImpl for CustomCompositorPad {
             subclass::Property("alpha", ..) => {
                 let settings = self.settings.lock().unwrap();
                 Ok(settings.alpha.to_value())
+            }
+            subclass::Property("repeat-black-on-eos", ..) => {
+                let settings = self.settings.lock().unwrap();
+                Ok(settings.repeat_black_on_eos.to_value())
             }
             _ => unimplemented!(),
         }
