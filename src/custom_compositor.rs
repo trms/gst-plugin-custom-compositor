@@ -299,7 +299,8 @@ impl CustomCompositor {
                     // otherwise continue using it. When a pad is marked to repeat black
                     // on EOS, we substitute the current frame with a black one, which
                     // we never time out (is_repeat = true).
-                    if !current.is_repeat && current.end_time + gst::SECOND <= time {
+                    if !current.is_repeat && ((current.end_time + gst::SECOND <= time) ||
+                                              (pad.is_eos() && current.end_time <= time)) {
                         gst_debug!(
                             CAT,
                             obj: pad,
