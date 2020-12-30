@@ -9,9 +9,9 @@ repository = "https://gstreamer.freedesktop.org"
 
 [dependencies]
 glib = "0.10"
-gstreamer = { version = "0.16", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", rev = "0.16", features = ["v1_18"] }
-gstreamer-base = { version = "0.16", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", rev = "0.16", features = ["v1_18"] }
-gstreamer-video = { version = "0.16", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", rev = "0.16", features = ["v1_18"] }
+gstreamer = { version = "0.16", features = ["v1_18"] }
+gstreamer-base = { version = "0.16", features = ["v1_18"] }
+gstreamer-video = { version = "0.16", features = ["v1_18"] }
 once_cell = "1.0"
 
 [lib]
