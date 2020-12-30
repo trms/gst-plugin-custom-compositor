@@ -295,12 +295,9 @@ impl CustomCompositor {
                 }
             } else {
                 if let Some(current) = current_frame {
-                    // Time out old frames if there was no new one for more than a second,
-                    // otherwise continue using it. When a pad is marked to repeat black
-                    // on EOS, we substitute the current frame with a black one, which
-                    // we never time out (is_repeat = true).
-                    if !current.is_repeat && ((current.end_time + gst::SECOND <= time) ||
-                                              (pad.is_eos() && current.end_time <= time)) {
+                    // When a pad is marked to repeat black on EOS, we substitute the current frame
+                    // with a black one, which we never time out (is_repeat = true).
+                    if !current.is_repeat && pad.is_eos() && current.end_time <= time {
                         gst_debug!(
                             CAT,
                             obj: pad,
@@ -309,11 +306,7 @@ impl CustomCompositor {
                             current.end_time
                         );
 
-                        if !pad.is_eos() {
-                            gst_debug!(CAT, obj: pad, "Waiting for more data");
-                            *current_frame = None;
-                            need_wait = true;
-                        } else if settings.repeat_black_on_eos {
+                        if settings.repeat_black_on_eos {
                             let info = gst_video::VideoInfo::builder(
                                 gst_video::VideoFormat::Uyvy,
                                 current.frame.info().width(),
@@ -349,7 +342,7 @@ impl CustomCompositor {
                             gst_debug!(CAT, obj: pad, "Pad is fully EOS now");
                             *current_frame = None;
                         }
-                    } else if pad.is_eos() {
+                    } else {
                         gst_trace!(
                             CAT,
                             obj: pad,
