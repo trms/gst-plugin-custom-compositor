@@ -111,14 +111,15 @@ fn composite_ayuv(
                 let i_y2 = i[5] as u16;
                 let i_u2 = i[6] as u16;
                 let i_v2 = i[7] as u16;
+                let i_a_avg = (i_a1 + i_a2) / 2;
 
-                let o_u = i_a1 * ((i_u1 + i_u2) / 2) + (255 - i_a1) * o_u;
+                let o_u = i_a_avg * ((i_u1 + i_u2) / 2) + (255 - i_a_avg) * o_u;
                 let o_u = (o_u / 255) as u8;
-                let o_v = i_a2 * ((i_v1 + i_v2) / 2) + (255 - i_a2) * o_v;
+                let o_v = i_a_avg * ((i_v1 + i_v2) / 2) + (255 - i_a_avg) * o_v;
                 let o_v = (o_v / 255) as u8;
                 let o_y1 = i_a1 * i_y1 + (255 - i_a1) * o_y1;
                 let o_y1 = (o_y1 / 255) as u8;
-                let o_y2 = i_a2 * i_y2 + (255 - i_a1) * o_y2;
+                let o_y2 = i_a2 * i_y2 + (255 - i_a2) * o_y2;
                 let o_y2 = (o_y2 / 255) as u8;
 
                 o[0] = o_u;
@@ -154,14 +155,15 @@ fn composite_ayuv(
                 let i_y2 = i[5] as u16;
                 let i_u2 = i[6] as u16;
                 let i_v2 = i[7] as u16;
+                let i_a_avg = (i_a1 + i_a2) / 2;
 
-                let o_u = i_a1 * ((i_u1 + i_u2) / 2) + (255 - i_a1) * o_u;
+                let o_u = i_a_avg * ((i_u1 + i_u2) / 2) + (255 - i_a_avg) * o_u;
                 let o_u = (o_u / 255) as u8;
-                let o_v = i_a2 * ((i_v1 + i_v2) / 2) + (255 - i_a2) * o_v;
+                let o_v = i_a_avg * ((i_v1 + i_v2) / 2) + (255 - i_a_avg) * o_v;
                 let o_v = (o_v / 255) as u8;
                 let o_y1 = i_a1 * i_y1 + (255 - i_a1) * o_y1;
                 let o_y1 = (o_y1 / 255) as u8;
-                let o_y2 = i_a2 * i_y2 + (255 - i_a1) * o_y2;
+                let o_y2 = i_a2 * i_y2 + (255 - i_a2) * o_y2;
                 let o_y2 = (o_y2 / 255) as u8;
 
                 o[0] = o_u;
