@@ -762,29 +762,27 @@ impl AggregatorImpl for CustomCompositor {
     }
 
     fn next_time(&self) -> Option<gst::ClockTime> {
-        let state_guard = self.state.lock().unwrap();
-        let state = match &*state_guard {
-            None => {
-                gst::debug!(CAT, imp = self, "Have no state yet");
-                return None;
-            }
-            Some(ref state) => state,
+        self.obj().simple_get_next_time()
+    }
+
+    fn flush(&self) -> Result<gst::FlowSuccess, gst::FlowError> {
+        let mut state = self.state.lock().unwrap();
+        *state = if let Some(old) = state.take() {
+            Some(State {
+                info: old.info.clone(),
+                start_time: gst::ClockTime::ZERO,
+                num_frames: 0,
+            })
+        } else {
+            None
         };
 
-        let next_time = state.start_time
-            + gst::ClockTime::from_nseconds(
-                state
-                    .num_frames
-                    .mul_div_ceil(
-                        gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
-                        state.info.fps().numer() as u64,
-                    )
-                    .unwrap(),
-            );
+        self.obj()
+            .src_pad()
+            .segment()
+            .set_position(None::<gst::ClockTime>);
 
-        gst::trace!(CAT, imp = self, "Next time {}", next_time);
-
-        Some(next_time)
+        Ok(gst::FlowSuccess::Ok)
     }
 
     fn clip(
@@ -858,16 +856,23 @@ impl AggregatorImpl for CustomCompositor {
             Some(ref mut state) => state,
         };
 
-        let time = state.start_time
-            + gst::ClockTime::from_nseconds(
-                state
-                    .num_frames
-                    .mul_div_ceil(
-                        gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
-                        state.info.fps().numer() as u64,
-                    )
-                    .unwrap(),
-            );
+        let src_segment = self
+            .obj()
+            .src_pad()
+            .segment()
+            .downcast::<gst::ClockTime>()
+            .expect("Non-TIME segment");
+
+        let time =
+            if src_segment.position().is_none() || src_segment.position() < src_segment.start() {
+                src_segment.start().unwrap()
+            } else {
+                src_segment.position().unwrap()
+            };
+
+        if state.num_frames == 0 {
+            state.start_time = time;
+        }
 
         let end_time = state.start_time
             + gst::ClockTime::from_nseconds(
@@ -1014,6 +1019,7 @@ impl AggregatorImpl for CustomCompositor {
         state.num_frames += 1;
         drop(state_guard);
 
+        self.obj().set_position(end_time);
         self.obj().finish_buffer(outbuf)
     }
 
@@ -1073,26 +1079,6 @@ impl AggregatorImpl for CustomCompositor {
 
         let mut state = self.state.lock().unwrap();
 
-        let start_time = if let Some(ref state) = &*state {
-            state.start_time
-                + gst::ClockTime::from_nseconds(
-                    state
-                        .num_frames
-                        .mul_div_ceil(
-                            gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
-                            state.info.fps().numer() as u64,
-                        )
-                        .unwrap(),
-                )
-        } else {
-            srcpad
-                .segment()
-                .downcast_ref::<gst::format::Time>()
-                .unwrap()
-                .position()
-                .unwrap_or(gst::ClockTime::ZERO)
-        };
-
         let info = gst_video::VideoInfo::from_caps(&caps).unwrap();
         let frame_duration = gst::ClockTime::SECOND
             .mul_div_ceil(info.fps().denom() as u64, info.fps().numer() as u64)
@@ -1100,20 +1086,14 @@ impl AggregatorImpl for CustomCompositor {
 
         *state = Some(State {
             info,
-            start_time,
+            start_time: gst::ClockTime::ZERO,
             num_frames: 0,
         });
 
         self.obj().set_src_caps(&caps);
         self.obj().set_latency(frame_duration, frame_duration);
 
-        gst::debug!(
-            CAT,
-            imp = self,
-            "Negotiated {}, new start time {}",
-            caps,
-            start_time
-        );
+        gst::debug!(CAT, imp = self, "Negotiated {}", caps,);
 
         true
     }
