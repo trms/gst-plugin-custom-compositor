@@ -1,21 +1,19 @@
-use glib;
-use glib::prelude::*;
-use glib::subclass;
-use glib::subclass::prelude::*;
-use gst;
+use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_base;
 use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
-use gst_video;
+use gst_video::prelude::*;
 
 use std::i32;
 use std::sync::Mutex;
 
+use once_cell::sync::Lazy;
+
 // FIXME: Does not enforce that all inputs/outputs have the same pixel aspect ratio
 
-static CAT: once_cell::sync::Lazy<gst::DebugCategory> = once_cell::sync::Lazy::new(|| {
+static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
         "custom-compositor",
         gst::DebugColorFlags::empty(),
@@ -30,7 +28,8 @@ struct State {
     num_frames: u64,
 }
 
-struct CustomCompositor {
+#[derive(Default)]
+pub struct CustomCompositor {
     // State once we're negotiated with downstream
     state: Mutex<Option<State>>,
 }
@@ -186,19 +185,20 @@ impl CustomCompositor {
         let mut all_eos = true;
         let mut need_wait = false;
 
-        gst_trace!(CAT, obj: &self.get_instance(), "Filling queues for {}-{}", time, end_time);
+        gst::trace!(CAT, imp = self, "Filling queues for {}-{}", time, end_time);
 
         for pad in pads {
-            let imp = CustomCompositorPad::from_instance(pad);
+            let cpad = pad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+            let imp = cpad.imp();
             let settings = imp.settings.lock().unwrap().clone();
             let mut state_guard = imp.state.lock().unwrap();
             if state_guard.is_none() {
                 continue;
             }
-            let segment = pad.get_segment();
+            let segment = pad.segment();
 
-            if segment.get_format() != gst::Format::Time {
-                gst_warning!(CAT, obj: pad, "Don't have a Time segment");
+            if segment.format() != gst::Format::Time {
+                gst::warning!(CAT, obj = pad, "Don't have a Time segment");
                 continue;
             }
 
@@ -212,17 +212,19 @@ impl CustomCompositor {
 
             let next_frame = pad.peek_buffer().and_then(|b| {
                 // Gap buffers
-                if b.get_size() == 0 {
+                if b.size() == 0 {
                     pad.drop_buffer();
                     return None;
                 }
-                let pts = b.get_pts();
-                let duration = b.get_duration();
-                assert!(pts.is_some());
-                assert!(duration.is_some());
+                let pts = b.pts().unwrap();
+                let pts_end = if let Some(duration) = b.duration() {
+                    pts + duration
+                } else {
+                    pts
+                };
 
-                let running_time = segment.to_running_time(pts);
-                let running_time_end = segment.to_running_time(pts + duration);
+                let running_time = segment.to_running_time(pts).unwrap();
+                let running_time_end = segment.to_running_time(pts_end).unwrap();
                 let frame = gst_video::VideoFrame::from_buffer_readable(b, info).unwrap();
 
                 Some(PadCurrentFrame {
@@ -239,24 +241,24 @@ impl CustomCompositor {
             }
 
             if let Some(ref next) = next_frame {
-                gst_trace!(
+                gst::trace!(
                     CAT,
-                    obj: pad,
+                    obj = pad,
                     "Got next buffer {}-{}",
                     next.start_time,
                     next.end_time
                 );
 
                 if Some(next.end_time) < current_frame.as_ref().map(|f| f.end_time) {
-                    gst_warning!(CAT, obj: pad, "Frame from the past, dropping");
+                    gst::warning!(CAT, obj = pad, "Frame from the past, dropping");
                     pad.drop_buffer();
                     continue;
                 }
 
                 if next.end_time >= time && next.start_time < end_time {
-                    gst_debug!(
+                    gst::debug!(
                         CAT,
-                        obj: pad,
+                        obj = pad,
                         "Taking next buffer {}-{}",
                         next.start_time,
                         next.end_time
@@ -265,9 +267,9 @@ impl CustomCompositor {
                     pad.drop_buffer();
                 } else if next.start_time >= end_time {
                     if let Some(ref current) = current_frame {
-                        gst_debug!(
+                        gst::debug!(
                             CAT,
-                            obj: pad,
+                            obj = pad,
                             "Keeping for later {}-{}, using current frame {}-{}",
                             next.start_time,
                             next.end_time,
@@ -275,18 +277,18 @@ impl CustomCompositor {
                             current.end_time,
                         );
                     } else {
-                        gst_debug!(
+                        gst::debug!(
                             CAT,
-                            obj: pad,
+                            obj = pad,
                             "Keeping for later {}-{}, no current frame",
                             next.start_time,
                             next.end_time
                         );
                     }
                 } else {
-                    gst_debug!(
+                    gst::debug!(
                         CAT,
-                        obj: pad,
+                        obj = pad,
                         "Taking next buffer {}-{} but waiting",
                         next.start_time,
                         next.end_time
@@ -300,9 +302,9 @@ impl CustomCompositor {
                     // When a pad is marked to repeat black on EOS, we substitute the current frame
                     // with a black one, which we never time out (is_repeat = true).
                     if !current.is_repeat && pad.is_eos() && current.end_time <= time {
-                        gst_debug!(
+                        gst::debug!(
                             CAT,
-                            obj: pad,
+                            obj = pad,
                             "Timing out old frame {}-{}",
                             current.start_time,
                             current.end_time
@@ -311,8 +313,8 @@ impl CustomCompositor {
                         if settings.repeat_black_on_eos {
                             let info = gst_video::VideoInfo::builder(
                                 gst_video::VideoFormat::Uyvy,
-                                current.frame.info().width(),
-                                current.frame.info().height(),
+                                current.frame.width(),
+                                current.frame.height(),
                             )
                             .build()
                             .unwrap();
@@ -334,20 +336,20 @@ impl CustomCompositor {
                                 )
                                 .unwrap(),
                                 converted_frame: None,
-                                start_time: gst::CLOCK_TIME_NONE,
-                                end_time: gst::CLOCK_TIME_NONE,
+                                start_time: gst::ClockTime::ZERO,
+                                end_time: gst::ClockTime::ZERO,
                                 is_repeat: true,
                             });
 
-                            gst_debug!(CAT, obj: pad, "Back in black");
+                            gst::debug!(CAT, obj = pad, "Back in black");
                         } else {
-                            gst_debug!(CAT, obj: pad, "Pad is fully EOS now");
+                            gst::debug!(CAT, obj = pad, "Pad is fully EOS now");
                             *current_frame = None;
                         }
                     } else {
-                        gst_trace!(
+                        gst::trace!(
                             CAT,
-                            obj: pad,
+                            obj = pad,
                             "Re-using old frame {}-{}",
                             current.start_time,
                             current.end_time
@@ -357,13 +359,20 @@ impl CustomCompositor {
                         }
                     }
                 } else if !pad.is_eos() {
-                    gst_debug!(CAT, obj: pad, "Waiting for more data");
+                    gst::debug!(CAT, obj = pad, "Waiting for more data");
                     need_wait = true;
                 }
             }
         }
 
-        gst_debug!(CAT, obj: &self.get_instance(), "Need waiting {}, timeout {}, all eos {}", need_wait, timeout, all_eos);
+        gst::debug!(
+            CAT,
+            imp = self,
+            "Need waiting {}, timeout {}, all eos {}",
+            need_wait,
+            timeout,
+            all_eos
+        );
 
         if need_wait && !timeout {
             Err(gst_base::AGGREGATOR_FLOW_NEED_DATA)
@@ -376,7 +385,8 @@ impl CustomCompositor {
 
     fn convert_frames(&self, pads: &[gst_base::AggregatorPad]) -> Result<(), gst::FlowError> {
         for pad in pads {
-            let imp = CustomCompositorPad::from_instance(pad);
+            let cpad = pad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+            let imp = cpad.imp();
             let settings = imp.settings.lock().unwrap().clone();
             let mut state_guard = imp.state.lock().unwrap();
 
@@ -435,9 +445,9 @@ impl CustomCompositor {
                     .build()
                     .unwrap();
 
-            gst_debug!(
+            gst::debug!(
                 CAT,
-                obj: pad,
+                obj = pad,
                 "Converting frame from {}x{} to {}x{}",
                 current_info.width(),
                 current_info.height(),
@@ -447,12 +457,12 @@ impl CustomCompositor {
 
             let converter = gst_video::VideoConverter::new(&current_info, &target_info, None)
                 .map_err(|_| {
-                    gst_error!(CAT, obj: pad, "Can't create converter");
+                    gst::error!(CAT, obj = pad, "Can't create converter");
                     gst::FlowError::NotNegotiated
                 })?;
 
             let converted_buf = gst::Buffer::with_size(target_info.size()).map_err(|_| {
-                gst_error!(CAT, obj: pad, "Can't allocate converted buffer");
+                gst::error!(CAT, obj = pad, "Can't allocate converted buffer");
                 gst::FlowError::NotNegotiated
             })?;
 
@@ -479,11 +489,12 @@ impl CustomCompositor {
         let out_height = out_frame.height() as usize;
 
         for pad in pads {
-            let imp = CustomCompositorPad::from_instance(pad);
+            let cpad = pad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+            let imp = cpad.imp();
 
             let settings = imp.settings.lock().unwrap().clone();
             if settings.alpha == 0.0 {
-                gst_debug!(CAT, obj: pad, "Skipping fully transparent pad");
+                gst::debug!(CAT, obj = pad, "Skipping fully transparent pad");
                 continue;
             }
 
@@ -512,7 +523,7 @@ impl CustomCompositor {
             let start_col =
                 if settings.xpos < 0 && settings.xpos.abs() as u64 >= vframe.width() as u64 {
                     // Nothing to copy, completely outside the output frame
-                    gst_debug!(CAT, obj: pad, "Skipping fully invisible pad");
+                    gst::debug!(CAT, obj = pad, "Skipping fully invisible pad");
                     continue;
                 } else if settings.xpos <= 0 {
                     // Need to copy to 0, start at width + xpos
@@ -524,14 +535,14 @@ impl CustomCompositor {
                     (settings.xpos as usize & !1, 0)
                 } else {
                     // Completely outside the output frame
-                    gst_debug!(CAT, obj: pad, "Skipping fully invisible pad");
+                    gst::debug!(CAT, obj = pad, "Skipping fully invisible pad");
                     continue;
                 };
 
             let start_row =
                 if settings.ypos < 0 && settings.ypos.abs() as u64 >= vframe.height() as u64 {
                     // Nothing to copy, completely outside the output frame
-                    gst_debug!(CAT, obj: pad, "Skipping fully invisible pad");
+                    gst::debug!(CAT, obj = pad, "Skipping fully invisible pad");
                     continue;
                 } else if settings.ypos <= 0 {
                     // Need to copy to 0, start at height + ypos
@@ -541,7 +552,7 @@ impl CustomCompositor {
                     (settings.ypos as usize, 0)
                 } else {
                     // Completely outside the output frame
-                    gst_debug!(CAT, obj: pad, "Skipping fully invisible pad");
+                    gst::debug!(CAT, obj = pad, "Skipping fully invisible pad");
                     continue;
                 };
 
@@ -555,9 +566,9 @@ impl CustomCompositor {
                 out_height - start_row.0,
             );
 
-            gst_debug!(
+            gst::debug!(
                 CAT,
-                obj: pad,
+                obj = pad,
                 "Compositing {}x{} from {:?} to {:?}",
                 copy_cols,
                 copy_rows,
@@ -603,243 +614,243 @@ impl CustomCompositor {
     }
 }
 
+#[glib::object_subclass]
 impl ObjectSubclass for CustomCompositor {
     const NAME: &'static str = "CustomCompositor";
+    type Type = super::CustomCompositor;
     type ParentType = gst_base::Aggregator;
-    type Instance = gst::subclass::ElementInstanceStruct<Self>;
-    type Class = subclass::simple::ClassStruct<Self>;
-
-    glib_object_subclass!();
-
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(None),
-        }
-    }
-
-    fn class_init(klass: &mut subclass::simple::ClassStruct<Self>) {
-        klass.set_metadata(
-            "Custom Compositor",
-            "Filter/Editor/Video/Compositor",
-            "Custom Compositor",
-            "Sebastian Dröge <sebastian@centricular.com>",
-        );
-
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", &"UYVY")
-            .field("width", &gst::IntRange::<i32>::new(1, i32::MAX))
-            .field("height", &gst::IntRange::<i32>::new(1, i32::MAX))
-            .field(
-                "framerate",
-                &gst::FractionRange::new(
-                    gst::Fraction::new(1, i32::MAX),
-                    gst::Fraction::new(i32::MAX, 1),
-                ),
-            )
-            .build();
-        let src_pad_template = gst::PadTemplate::with_gtype(
-            "src",
-            gst::PadDirection::Src,
-            gst::PadPresence::Always,
-            &caps,
-            gst_base::AggregatorPad::static_type(),
-        )
-        .unwrap();
-        klass.add_pad_template(src_pad_template);
-
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", &gst::List::new(&[&"UYVY", &"AYUV"]))
-            .field("width", &gst::IntRange::<i32>::new(1, i32::MAX))
-            .field("height", &gst::IntRange::<i32>::new(1, i32::MAX))
-            .field(
-                "framerate",
-                &gst::FractionRange::new(
-                    gst::Fraction::new(1, i32::MAX),
-                    gst::Fraction::new(i32::MAX, 1),
-                ),
-            )
-            .build();
-        let sink_pad_template = gst::PadTemplate::with_gtype(
-            "sink_%u",
-            gst::PadDirection::Sink,
-            gst::PadPresence::Request,
-            &caps,
-            CustomCompositorPad::get_type(),
-        )
-        .unwrap();
-        klass.add_pad_template(sink_pad_template);
-    }
-
-    fn type_init(type_: &mut subclass::InitializingType<Self>) {
-        type_.add_interface::<gst::ChildProxy>();
-    }
+    type Interfaces = (gst::ChildProxy,);
 }
 
+impl GstObjectImpl for CustomCompositor {}
+
 impl ChildProxyImpl for CustomCompositor {
-    fn get_child_by_name(&self, proxy: &gst::ChildProxy, name: &str) -> Option<glib::Object> {
-        let element = proxy.dynamic_cast_ref::<gst::Element>().unwrap();
-        let pad = element.get_static_pad(name);
-        if pad.as_ref().map(|p| p.get_direction()) == Some(gst::PadDirection::Sink) {
-            pad.map(|p| p.upcast())
-        } else {
-            None
-        }
+    fn child_by_name(&self, name: &str) -> Option<glib::Object> {
+        let object = self.obj();
+        object
+            .pads()
+            .into_iter()
+            .find(|p| p.name() == name)
+            .map(|p| p.upcast())
     }
 
-    fn get_child_by_index(&self, proxy: &gst::ChildProxy, index: u32) -> Option<glib::Object> {
-        let element = proxy.dynamic_cast_ref::<gst::Element>().unwrap();
-        element
-            .get_sink_pads()
-            .get(index as usize)
-            .map(|p| p.clone().upcast())
+    fn child_by_index(&self, index: u32) -> Option<glib::Object> {
+        let object = self.obj();
+        object
+            .pads()
+            .into_iter()
+            .nth(index as usize)
+            .map(|p| p.upcast())
     }
 
-    fn get_children_count(&self, proxy: &gst::ChildProxy) -> u32 {
-        let element = proxy.dynamic_cast_ref::<gst::Element>().unwrap();
-        element.num_sink_pads() as u32
+    fn children_count(&self) -> u32 {
+        let object = self.obj();
+        object.num_pads() as u32
     }
 }
 
 impl ObjectImpl for CustomCompositor {
-    glib_object_impl!();
-
-    fn constructed(&self, obj: &glib::Object) {
-        self.parent_constructed(obj);
+    fn constructed(&self) {
+        self.parent_constructed();
     }
 }
 
 impl ElementImpl for CustomCompositor {
+    fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
+        static ELEMENT_METADATA: Lazy<gst::subclass::ElementMetadata> = Lazy::new(|| {
+            gst::subclass::ElementMetadata::new(
+                "Custom Compositor",
+                "Filter/Editor/Video/Compositor",
+                "Custom Compositor",
+                "Sebastian Dröge <sebastian@centricular.com>",
+            )
+        });
+
+        Some(&*ELEMENT_METADATA)
+    }
+
+    fn pad_templates() -> &'static [gst::PadTemplate] {
+        static PAD_TEMPLATES: Lazy<Vec<gst::PadTemplate>> = Lazy::new(|| {
+            let src_pad_template = gst::PadTemplate::with_gtype(
+                "src",
+                gst::PadDirection::Src,
+                gst::PadPresence::Always,
+                &gst::Caps::builder("video/x-raw")
+                    .field("format", &"UYVY")
+                    .field("width", &gst::IntRange::<i32>::new(1, i32::MAX))
+                    .field("height", &gst::IntRange::<i32>::new(1, i32::MAX))
+                    .field(
+                        "framerate",
+                        &gst::FractionRange::new(
+                            gst::Fraction::new(1, i32::MAX),
+                            gst::Fraction::new(i32::MAX, 1),
+                        ),
+                    )
+                    .build(),
+                gst_base::AggregatorPad::static_type(),
+            )
+            .unwrap();
+
+            let sink_pad_template = gst::PadTemplate::with_gtype(
+                "sink_%u",
+                gst::PadDirection::Sink,
+                gst::PadPresence::Request,
+                &gst::Caps::builder("video/x-raw")
+                    .field("format", &gst::List::new(&[&"UYVY", &"AYUV"]))
+                    .field("width", &gst::IntRange::<i32>::new(1, i32::MAX))
+                    .field("height", &gst::IntRange::<i32>::new(1, i32::MAX))
+                    .field(
+                        "framerate",
+                        &gst::FractionRange::new(
+                            gst::Fraction::new(1, i32::MAX),
+                            gst::Fraction::new(i32::MAX, 1),
+                        ),
+                    )
+                    .build(),
+                super::CustomCompositorPad::static_type(),
+            )
+            .unwrap();
+
+            vec![src_pad_template, sink_pad_template]
+        });
+
+        PAD_TEMPLATES.as_ref()
+    }
+
     fn request_new_pad(
         &self,
-        element: &gst::Element,
         templ: &gst::PadTemplate,
-        name: Option<String>,
+        name: Option<&str>,
         caps: Option<&gst::Caps>,
     ) -> Option<gst::Pad> {
-        let agg = element.downcast_ref::<gst_base::Aggregator>().unwrap();
-        let sink_templ = agg.get_pad_template("sink_%u").unwrap();
+        let obj = self.obj();
+        let sink_templ = obj.pad_template("sink_%u").unwrap();
         if templ != &sink_templ {
-            gst_error!(CAT, obj: agg, "Wrong pad template");
+            gst::error!(CAT, imp = self, "Wrong pad template");
             return None;
         }
 
         let pad = self
-            .parent_request_new_pad(element, templ, name, caps)?
+            .parent_request_new_pad(templ, name, caps)?
             .downcast::<gst_base::AggregatorPad>()
             .unwrap();
+        let cpad = pad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+        let imp = cpad.imp();
+        imp.settings.lock().unwrap().zorder = obj.num_sink_pads() as u32;
 
-        let imp = CustomCompositorPad::from_instance(&pad);
-        imp.settings.lock().unwrap().zorder = agg.num_sink_pads() as u32;
-
-        let proxy = agg.dynamic_cast_ref::<gst::ChildProxy>().unwrap();
-        proxy.child_added(&pad, &pad.get_name());
+        let proxy = obj.dynamic_cast_ref::<gst::ChildProxy>().unwrap();
+        proxy.child_added(&pad, &pad.name());
 
         Some(pad.upcast())
     }
 
-    fn release_pad(&self, element: &gst::Element, pad: &gst::Pad) {
-        let agg = element.downcast_ref::<gst_base::Aggregator>().unwrap();
-
-        let proxy = agg.dynamic_cast_ref::<gst::ChildProxy>().unwrap();
-        proxy.child_removed(pad, &pad.get_name());
-
-        self.parent_release_pad(element, pad);
+    fn release_pad(&self, pad: &gst::Pad) {
+        self.obj().child_removed(pad, &pad.name());
+        self.parent_release_pad(pad);
     }
 }
 
 impl AggregatorImpl for CustomCompositor {
-    fn start(&self, _agg: &gst_base::Aggregator) -> Result<(), gst::ErrorMessage> {
+    fn start(&self) -> Result<(), gst::ErrorMessage> {
         Ok(())
     }
 
-    fn stop(&self, _agg: &gst_base::Aggregator) -> Result<(), gst::ErrorMessage> {
+    fn stop(&self) -> Result<(), gst::ErrorMessage> {
         // Drop our state now
         let _ = self.state.lock().unwrap().take();
         Ok(())
     }
 
-    fn get_next_time(&self, agg: &gst_base::Aggregator) -> gst::ClockTime {
+    fn next_time(&self) -> Option<gst::ClockTime> {
         let state_guard = self.state.lock().unwrap();
         let state = match &*state_guard {
             None => {
-                gst_debug!(CAT, obj: agg, "Have no state yet");
-                return gst::CLOCK_TIME_NONE;
+                gst::debug!(CAT, imp = self, "Have no state yet");
+                return None;
             }
             Some(ref state) => state,
         };
 
         let next_time = state.start_time
-            + gst::ClockTime::from(state.num_frames.mul_div_ceil(
-                gst::SECOND_VAL * *state.info.fps().denom() as u64,
-                *state.info.fps().numer() as u64,
-            ));
+            + gst::ClockTime::from_nseconds(
+                state
+                    .num_frames
+                    .mul_div_ceil(
+                        gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
+                        state.info.fps().numer() as u64,
+                    )
+                    .unwrap(),
+            );
 
-        gst_trace!(CAT, obj: agg, "Next time {}", next_time);
+        gst::trace!(CAT, imp = self, "Next time {}", next_time);
 
-        next_time
+        Some(next_time)
     }
 
     fn clip(
         &self,
-        agg: &gst_base::Aggregator,
         agg_pad: &gst_base::AggregatorPad,
         mut buffer: gst::Buffer,
     ) -> Option<gst::Buffer> {
-        let segment = match agg_pad.get_segment().downcast::<gst::ClockTime>() {
+        let segment = match agg_pad.segment().downcast::<gst::ClockTime>() {
             Ok(segment) => segment,
             Err(_) => {
-                gst_error!(CAT, obj: agg, "Only TIME segments supported");
+                gst::error!(CAT, imp = self, "Only TIME segments supported");
                 return Some(buffer);
             }
         };
 
-        let pts = buffer.get_pts();
+        let pts = buffer.pts();
         if pts.is_none() {
-            gst_error!(CAT, obj: agg, "Only buffers with PTS supported");
+            gst::error!(CAT, imp = self, "Only buffers with PTS supported");
             return Some(buffer);
         }
 
-        let duration = if buffer.get_duration().is_some() {
-            buffer.get_duration()
+        let duration = if buffer.duration().is_some() {
+            buffer.duration()
         } else {
-            gst::CLOCK_TIME_NONE
+            None
         };
 
-        gst_trace!(
+        let pts = pts.unwrap();
+        let pts_end = if let Some(duration) = duration {
+            pts + duration
+        } else {
+            pts
+        };
+
+        gst::trace!(
             CAT,
-            obj: agg_pad,
+            obj = agg_pad,
             "Clipping buffer {:?} with PTS {} and duration {}",
             buffer,
             pts,
-            duration
+            duration.display()
         );
 
-        segment.clip(pts, pts + duration).map(|(start, stop)| {
+        segment.clip(pts, pts_end).map(|(start, stop)| {
             {
-                gst_trace!(
+                gst::trace!(
                     CAT,
-                    obj: agg_pad,
+                    obj = agg_pad,
                     "Clipped to start {} stop {}",
-                    start,
-                    stop,
+                    start.display(),
+                    stop.display(),
                 );
 
                 let buffer = buffer.make_mut();
                 buffer.set_pts(start);
-                if duration.is_some() {
-                    buffer.set_duration(stop - start);
-                }
+                buffer.set_duration(
+                    stop.zip(start)
+                        .and_then(|(stop, start)| stop.checked_sub(start)),
+                );
             }
 
             buffer
         })
     }
 
-    fn aggregate(
-        &self,
-        agg: &gst_base::Aggregator,
-        timeout: bool,
-    ) -> Result<gst::FlowSuccess, gst::FlowError> {
+    fn aggregate(&self, timeout: bool) -> Result<gst::FlowSuccess, gst::FlowError> {
         let mut state_guard = self.state.lock().unwrap();
 
         let state = match &mut *state_guard {
@@ -848,20 +859,29 @@ impl AggregatorImpl for CustomCompositor {
         };
 
         let time = state.start_time
-            + gst::ClockTime::from(state.num_frames.mul_div_ceil(
-                gst::SECOND_VAL * *state.info.fps().denom() as u64,
-                *state.info.fps().numer() as u64,
-            ));
+            + gst::ClockTime::from_nseconds(
+                state
+                    .num_frames
+                    .mul_div_ceil(
+                        gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
+                        state.info.fps().numer() as u64,
+                    )
+                    .unwrap(),
+            );
 
         let end_time = state.start_time
-            + gst::ClockTime::from((state.num_frames + 1).mul_div_ceil(
-                gst::SECOND_VAL * *state.info.fps().denom() as u64,
-                *state.info.fps().numer() as u64,
-            ));
+            + gst::ClockTime::from_nseconds(
+                (state.num_frames + 1)
+                    .mul_div_ceil(
+                        gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
+                        state.info.fps().numer() as u64,
+                    )
+                    .unwrap(),
+            );
 
-        gst_debug!(
+        gst::debug!(
             CAT,
-            obj: agg,
+            imp = self,
             "Aggregating for {} with framerate {} (timeout: {})",
             time,
             state.info.fps(),
@@ -869,26 +889,28 @@ impl AggregatorImpl for CustomCompositor {
         );
 
         // Get all negotiated sinkpads and sort them by their zorder
-        let mut pads = agg
-            .get_sink_pads()
+        let mut pads = self
+            .obj()
+            .sink_pads()
             .into_iter()
             .filter_map(|p| {
-                let p = p.downcast::<gst_base::AggregatorPad>().unwrap();
-                let imp = CustomCompositorPad::from_instance(&p);
+                let apad = p.downcast::<gst_base::AggregatorPad>().unwrap();
+                let cpad = apad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+                let imp = cpad.imp();
                 if imp.state.lock().unwrap().is_some() {
-                    Some(p)
+                    Some(apad)
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
+
         pads.sort_by(|a, b| {
-            let imp_a = CustomCompositorPad::from_instance(a);
-            let imp_b = CustomCompositorPad::from_instance(b);
+            let cpad_a = a.downcast_ref::<super::CustomCompositorPad>().unwrap();
+            let cpad_b = b.downcast_ref::<super::CustomCompositorPad>().unwrap();
 
-            let a_zorder = imp_a.settings.lock().unwrap().zorder;
-
-            let b_zorder = imp_b.settings.lock().unwrap().zorder;
+            let a_zorder = cpad_a.imp().settings.lock().unwrap().zorder;
+            let b_zorder = cpad_b.imp().settings.lock().unwrap().zorder;
 
             a_zorder.cmp(&b_zorder)
         });
@@ -898,7 +920,8 @@ impl AggregatorImpl for CustomCompositor {
 
         drop(state_guard);
 
-        agg.selected_samples(time, gst::CLOCK_TIME_NONE, end_time - time, None);
+        self.obj()
+            .selected_samples(time, None, end_time - time, None);
 
         let mut state_guard = self.state.lock().unwrap();
 
@@ -911,7 +934,10 @@ impl AggregatorImpl for CustomCompositor {
 
         // Check if we can use the first pad's buffer as background
         let first_pad_buffer = pads.get(0).and_then(|first_pad| {
-            let imp = CustomCompositorPad::from_instance(first_pad);
+            let cpad = first_pad
+                .downcast_ref::<super::CustomCompositorPad>()
+                .unwrap();
+            let imp = cpad.imp();
             let pad_state_guard = imp.state.lock().unwrap();
             let pad_settings = imp.settings.lock().unwrap().clone();
 
@@ -927,7 +953,7 @@ impl AggregatorImpl for CustomCompositor {
                     && pad_state.current_frame.is_some()
                 {
                     let current_frame = pad_state.current_frame.as_ref().unwrap();
-                    gst_debug!(CAT, obj: agg, "Taking first pad's buffer as background");
+                    gst::debug!(CAT, imp = self, "Taking first pad's buffer as background");
                     Some(current_frame.frame.buffer().to_owned())
                 } else {
                     None
@@ -945,7 +971,7 @@ impl AggregatorImpl for CustomCompositor {
                 (buffer, false)
             }
             None => {
-                gst_debug!(CAT, obj: agg, "Allocating background");
+                gst::debug!(CAT, imp = self, "Allocating background");
                 (gst::Buffer::with_size(state.info.size()).unwrap(), true)
             }
         };
@@ -988,21 +1014,17 @@ impl AggregatorImpl for CustomCompositor {
         state.num_frames += 1;
         drop(state_guard);
 
-        agg.finish_buffer(outbuf)
+        self.obj().finish_buffer(outbuf)
     }
 
-    fn sink_event(
-        &self,
-        agg: &gst_base::Aggregator,
-        pad: &gst_base::AggregatorPad,
-        event: gst::Event,
-    ) -> bool {
+    fn sink_event(&self, pad: &gst_base::AggregatorPad, event: gst::Event) -> bool {
         use gst::EventView;
 
         match event.view() {
             EventView::Caps(caps) => {
-                let imp = CustomCompositorPad::from_instance(pad);
-                let caps = caps.get_caps();
+                let cpad = pad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+                let imp = cpad.imp();
+                let caps = caps.caps();
                 let mut pad_state_guard = imp.state.lock().unwrap();
 
                 match &mut *pad_state_guard {
@@ -1020,30 +1042,25 @@ impl AggregatorImpl for CustomCompositor {
             _ => (),
         }
 
-        self.parent_sink_event(agg, pad, event)
+        self.parent_sink_event(pad, event)
     }
 
-    fn negotiate(&self, agg: &gst_base::Aggregator) -> bool {
-        let srcpad = agg
-            .get_static_pad("src")
-            .unwrap()
-            .downcast::<gst_base::AggregatorPad>()
-            .unwrap();
-        let templ_caps = srcpad.get_pad_template_caps().unwrap();
+    fn negotiate(&self) -> bool {
+        let obj = self.obj();
+        let srcpad = obj.src_pad();
+        let templ_caps = srcpad.pad_template_caps();
 
-        let mut caps = srcpad
-            .peer_query_caps(Some(&templ_caps))
-            .unwrap_or(templ_caps);
+        let mut caps = srcpad.peer_query_caps(Some(&templ_caps));
 
         if caps.is_empty() {
-            gst_error!(CAT, obj: agg, "No supported downstream caps");
+            gst::error!(CAT, imp = self, "No supported downstream caps");
             return false;
         }
 
         caps.truncate();
         {
             let caps = caps.make_mut();
-            let s = caps.get_mut_structure(0).unwrap();
+            let s = caps.structure_mut(0).unwrap();
 
             s.fixate_field_nearest_int("width", 320);
             s.fixate_field_nearest_int("height", 240);
@@ -1058,26 +1075,27 @@ impl AggregatorImpl for CustomCompositor {
 
         let start_time = if let Some(ref state) = &*state {
             state.start_time
-                + gst::ClockTime::from(state.num_frames.mul_div_ceil(
-                    gst::SECOND_VAL * *state.info.fps().denom() as u64,
-                    *state.info.fps().numer() as u64,
-                ))
+                + gst::ClockTime::from_nseconds(
+                    state
+                        .num_frames
+                        .mul_div_ceil(
+                            gst::ClockTime::SECOND.nseconds() * state.info.fps().denom() as u64,
+                            state.info.fps().numer() as u64,
+                        )
+                        .unwrap(),
+                )
         } else {
-            let position = srcpad
-                .get_segment()
+            srcpad
+                .segment()
                 .downcast_ref::<gst::format::Time>()
                 .unwrap()
-                .get_position();
-            if position.is_none() {
-                0.into()
-            } else {
-                position
-            }
+                .position()
+                .unwrap_or(gst::ClockTime::ZERO)
         };
 
         let info = gst_video::VideoInfo::from_caps(&caps).unwrap();
-        let frame_duration = gst::SECOND
-            .mul_div_ceil(*info.fps().denom() as u64, *info.fps().numer() as u64)
+        let frame_duration = gst::ClockTime::SECOND
+            .mul_div_ceil(info.fps().denom() as u64, info.fps().numer() as u64)
             .unwrap();
 
         *state = Some(State {
@@ -1086,12 +1104,12 @@ impl AggregatorImpl for CustomCompositor {
             num_frames: 0,
         });
 
-        agg.set_src_caps(&caps);
-        agg.set_latency(frame_duration, frame_duration);
+        self.obj().set_src_caps(&caps);
+        self.obj().set_latency(frame_duration, frame_duration);
 
-        gst_debug!(
+        gst::debug!(
             CAT,
-            obj: agg,
+            imp = self,
             "Negotiated {}, new start time {}",
             caps,
             start_time
@@ -1100,12 +1118,9 @@ impl AggregatorImpl for CustomCompositor {
         true
     }
 
-    fn peek_next_sample(
-        &self,
-        _aggregator: &gst_base::Aggregator,
-        pad: &gst_base::AggregatorPad,
-    ) -> Option<gst::Sample> {
-        let imp = CustomCompositorPad::from_instance(pad);
+    fn peek_next_sample(&self, pad: &gst_base::AggregatorPad) -> Option<gst::Sample> {
+        let obj = pad.downcast_ref::<super::CustomCompositorPad>().unwrap();
+        let imp = obj.imp();
 
         let mut state_guard = imp.state.lock().unwrap();
         if state_guard.is_none() {
@@ -1133,89 +1148,11 @@ impl AggregatorImpl for CustomCompositor {
             gst::Sample::builder()
                 .buffer(&vframe.buffer_owned())
                 .caps(&vframe.info().to_caps().unwrap())
-                .segment(&pad.get_segment())
+                .segment(&pad.segment())
                 .build(),
         )
     }
 }
-
-static PAD_PROPERTIES: [subclass::Property; 7] = [
-    subclass::Property("zorder", |name| {
-        glib::ParamSpec::uint(
-            name,
-            "Z Order",
-            "Z order of the picture",
-            0,
-            std::u32::MAX,
-            0,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-    subclass::Property("xpos", |name| {
-        glib::ParamSpec::int(
-            name,
-            "X Position",
-            "X position of the picture",
-            std::i32::MIN,
-            std::i32::MAX,
-            0,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-    subclass::Property("ypos", |name| {
-        glib::ParamSpec::int(
-            name,
-            "Y Position",
-            "Y position of the picture",
-            std::i32::MIN,
-            std::i32::MAX,
-            0,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-    subclass::Property("width", |name| {
-        glib::ParamSpec::int(
-            name,
-            "Width",
-            "Width of the picture",
-            std::i32::MIN,
-            std::i32::MAX,
-            0,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-    subclass::Property("height", |name| {
-        glib::ParamSpec::int(
-            name,
-            "Height",
-            "Height of the picture",
-            std::i32::MIN,
-            std::i32::MAX,
-            0,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-    subclass::Property("alpha", |name| {
-        glib::ParamSpec::double(
-            name,
-            "Alpha",
-            "Alpha of the picture",
-            0.0,
-            1.0,
-            1.0,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-    subclass::Property("repeat-black-on-eos", |name| {
-        glib::ParamSpec::boolean(
-            name,
-            "Repeat black on EOS",
-            "Whether the pad should repeat black frames on EOS until removed",
-            false,
-            glib::ParamFlags::READWRITE,
-        )
-    }),
-];
 
 struct PadCurrentFrame {
     frame: gst_video::VideoFrame<gst_video::video_frame::Readable>,
@@ -1255,119 +1192,158 @@ impl Default for PadSettings {
     }
 }
 
-struct CustomCompositorPad {
+#[derive(Default)]
+pub struct CustomCompositorPad {
     // State after we're negotiated
     state: Mutex<Option<PadState>>,
     // Pad properties
     settings: Mutex<PadSettings>,
 }
 
+#[glib::object_subclass]
 impl ObjectSubclass for CustomCompositorPad {
     const NAME: &'static str = "CustomCompositorPad";
+    type Type = super::CustomCompositorPad;
     type ParentType = gst_base::AggregatorPad;
-    type Instance = subclass::simple::InstanceStruct<Self>;
-    type Class = subclass::simple::ClassStruct<Self>;
-
-    glib_object_subclass!();
-
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(None),
-            settings: Mutex::new(PadSettings::default()),
-        }
-    }
-
-    fn class_init(klass: &mut subclass::simple::ClassStruct<Self>) {
-        klass.install_properties(&PAD_PROPERTIES);
-    }
 }
 
 impl ObjectImpl for CustomCompositorPad {
-    glib_object_impl!();
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
+            vec![
+                glib::ParamSpecUInt::builder("zorder")
+                    .nick("Z Order")
+                    .blurb("Z order of the picture")
+                    .minimum(0)
+                    .maximum(std::u32::MAX)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecInt::builder("xpos")
+                    .nick("X Position")
+                    .blurb("X position of the picture")
+                    .minimum(std::i32::MIN)
+                    .maximum(std::i32::MAX)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecInt::builder("ypos")
+                    .nick("Y Position")
+                    .blurb("Y position of the picture")
+                    .minimum(std::i32::MIN)
+                    .maximum(std::i32::MAX)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecInt::builder("width")
+                    .nick("Width")
+                    .blurb("Width of the picture")
+                    .minimum(std::i32::MIN)
+                    .maximum(std::i32::MAX)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecInt::builder("height")
+                    .nick("Height")
+                    .blurb("Height of the picture")
+                    .minimum(std::i32::MIN)
+                    .maximum(std::i32::MAX)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecDouble::builder("alpha")
+                    .nick("Alpha")
+                    .blurb("Alpha of the picture")
+                    .minimum(0.0)
+                    .maximum(1.0)
+                    .default_value(1.0)
+                    .build(),
+                glib::ParamSpecBoolean::builder("repeat-black-on-eos")
+                    .nick("Repeat black on EOS")
+                    .blurb("Whether the pad should repeat black frames on EOS until removed")
+                    .default_value(false)
+                    .build(),
+            ]
+        });
 
-    fn set_property(&self, obj: &glib::Object, id: usize, value: &glib::Value) {
-        let prop = &PAD_PROPERTIES[id];
-        let pad = obj.downcast_ref::<gst_base::AggregatorPad>().unwrap();
+        &PROPERTIES
+    }
 
-        match *prop {
-            subclass::Property("zorder", ..) => {
+    fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        match pspec.name() {
+            "zorder" => {
                 let mut settings = self.settings.lock().unwrap();
-                let zorder = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let zorder = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing zorder from {} to {}",
                     settings.zorder,
                     zorder,
                 );
                 settings.zorder = zorder;
             }
-            subclass::Property("xpos", ..) => {
+            "xpos" => {
                 let mut settings = self.settings.lock().unwrap();
-                let xpos = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let xpos = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing xpos from {} to {}",
                     settings.xpos,
                     xpos,
                 );
                 settings.xpos = xpos;
             }
-            subclass::Property("ypos", ..) => {
+            "ypos" => {
                 let mut settings = self.settings.lock().unwrap();
-                let ypos = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let ypos = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing ypos from {} to {}",
                     settings.ypos,
                     ypos,
                 );
                 settings.ypos = ypos;
             }
-            subclass::Property("width", ..) => {
+            "width" => {
                 let mut settings = self.settings.lock().unwrap();
-                let width = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let width = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing width from {} to {}",
                     settings.width,
                     width,
                 );
                 settings.width = width;
             }
-            subclass::Property("height", ..) => {
+            "height" => {
                 let mut settings = self.settings.lock().unwrap();
-                let height = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let height = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing height from {} to {}",
                     settings.height,
                     height,
                 );
                 settings.height = height;
             }
-            subclass::Property("alpha", ..) => {
+            "alpha" => {
                 let mut settings = self.settings.lock().unwrap();
-                let alpha = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let alpha = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing alpha from {} to {}",
                     settings.alpha,
                     alpha,
                 );
                 settings.alpha = alpha;
             }
-            subclass::Property("repeat-black-on-eos", ..) => {
+            "repeat-black-on-eos" => {
                 let mut settings = self.settings.lock().unwrap();
-                let repeat = value.get_some().expect("type checked upstream");
-                gst_info!(
+                let repeat = value.get().expect("type checked upstream");
+                gst::info!(
                     CAT,
-                    obj: pad,
+                    imp = self,
                     "Changing repeat black on EOS from {} to {}",
                     settings.repeat_black_on_eos,
                     repeat,
@@ -1378,37 +1354,35 @@ impl ObjectImpl for CustomCompositorPad {
         }
     }
 
-    fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
-        let prop = &PAD_PROPERTIES[id];
-
-        match *prop {
-            subclass::Property("zorder", ..) => {
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        match pspec.name() {
+            "zorder" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.zorder.to_value())
+                settings.zorder.to_value()
             }
-            subclass::Property("xpos", ..) => {
+            "xpos" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.xpos.to_value())
+                settings.xpos.to_value()
             }
-            subclass::Property("ypos", ..) => {
+            "ypos" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.ypos.to_value())
+                settings.ypos.to_value()
             }
-            subclass::Property("width", ..) => {
+            "width" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.width.to_value())
+                settings.width.to_value()
             }
-            subclass::Property("height", ..) => {
+            "height" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.height.to_value())
+                settings.height.to_value()
             }
-            subclass::Property("alpha", ..) => {
+            "alpha" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.alpha.to_value())
+                settings.alpha.to_value()
             }
-            subclass::Property("repeat-black-on-eos", ..) => {
+            "repeat-black-on-eos" => {
                 let settings = self.settings.lock().unwrap();
-                Ok(settings.repeat_black_on_eos.to_value())
+                settings.repeat_black_on_eos.to_value()
             }
             _ => unimplemented!(),
         }
@@ -1417,12 +1391,4 @@ impl ObjectImpl for CustomCompositorPad {
 
 impl PadImpl for CustomCompositorPad {}
 impl AggregatorPadImpl for CustomCompositorPad {}
-
-pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    gst::Element::register(
-        Some(plugin),
-        "custom-compositor",
-        gst::Rank::None,
-        CustomCompositor::get_type(),
-    )
-}
+impl GstObjectImpl for CustomCompositorPad {}
