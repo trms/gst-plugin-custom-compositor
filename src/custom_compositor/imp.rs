@@ -1032,16 +1032,29 @@ impl AggregatorImpl for CustomCompositor {
                 let imp = cpad.imp();
                 let caps = caps.caps();
                 let mut pad_state_guard = imp.state.lock().unwrap();
+                let info = gst_video::VideoInfo::from_caps(caps).unwrap();
+                let buf_duration = if info.fps().numer() > 0 && info.fps().denom() > 0 {
+                    Some(gst::ClockTime::from_nseconds(
+                        gst::ClockTime::SECOND
+                            .nseconds()
+                            .mul_div_ceil(info.fps().denom() as u64, info.fps().numer() as u64)
+                            .unwrap(),
+                    ))
+                } else {
+                    None
+                };
 
                 match &mut *pad_state_guard {
                     None => {
                         *pad_state_guard = Some(PadState {
-                            info: gst_video::VideoInfo::from_caps(caps).unwrap(),
+                            info,
                             current_frame: None,
+                            buf_duration,
                         });
                     }
                     Some(ref mut state) => {
-                        state.info = gst_video::VideoInfo::from_caps(caps).unwrap();
+                        state.info = info;
+                        state.buf_duration = buf_duration;
                     }
                 }
             }
@@ -1145,6 +1158,7 @@ struct PadCurrentFrame {
 struct PadState {
     info: gst_video::VideoInfo,
     current_frame: Option<PadCurrentFrame>,
+    buf_duration: Option<gst::ClockTime>,
 }
 
 #[derive(Clone)]
@@ -1370,5 +1384,86 @@ impl ObjectImpl for CustomCompositorPad {
 }
 
 impl PadImpl for CustomCompositorPad {}
-impl AggregatorPadImpl for CustomCompositorPad {}
 impl GstObjectImpl for CustomCompositorPad {}
+
+impl AggregatorPadImpl for CustomCompositorPad {
+    fn skip_buffer(&self, agg: &gst_base::Aggregator, buf: &gst::Buffer) -> bool {
+        let pts = match buf.pts() {
+            Some(pts) => pts,
+            _ => {
+                gst::debug!(CAT, imp = self, "Skipping buffer without pts {:?}", buf,);
+                return true;
+            }
+        };
+
+        let mut end_pts = pts;
+        if let Some(dur) = buf.duration() {
+            end_pts += dur;
+        } else {
+            let pad_state = self.state.lock().unwrap();
+            if let Some(ref state) = &*pad_state {
+                if let Some(dur) = state.buf_duration {
+                    end_pts += dur;
+                }
+            }
+        };
+
+        let sink_segment = self.obj().segment();
+        if sink_segment.format() != gst::Format::Time {
+            gst::error!(
+                CAT,
+                imp = self,
+                "Non-time segment, dropping buffer {:?}",
+                buf,
+            );
+            return true;
+        }
+
+        let src_segment = agg.src_pad().segment();
+        if src_segment.format() != gst::Format::Time {
+            gst::debug!(CAT, imp = self, "Src segment is not configured");
+
+            return false;
+        }
+
+        let sink_segment = sink_segment
+            .downcast_ref::<gst::format::Time>()
+            .unwrap()
+            .clone();
+        if sink_segment.start().unwrap() > pts {
+            gst::debug!(CAT, imp = self, "Dropping out of segment buffer {:?}", buf,);
+
+            return true;
+        }
+
+        let src_segment = src_segment
+            .downcast_ref::<gst::format::Time>()
+            .unwrap()
+            .clone();
+        let position = match src_segment.position() {
+            Some(position) => position,
+            _ => {
+                gst::debug!(CAT, imp = self, "Src segment's position is not configured");
+
+                return false;
+            }
+        };
+
+        let out_running_time = src_segment.to_running_time(position).unwrap();
+        let buffer_running_time = sink_segment.to_running_time(end_pts).unwrap();
+
+        if buffer_running_time < out_running_time {
+            gst::debug!(
+                CAT,
+                imp = self,
+                "Dropping late buffer, buffer time {}, output time {}",
+                buffer_running_time,
+                out_running_time,
+            );
+
+            true
+        } else {
+            false
+        }
+    }
+}
