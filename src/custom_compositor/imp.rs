@@ -210,37 +210,47 @@ impl CustomCompositor {
                 ..
             } = state_guard.as_mut().unwrap();
 
-            let next_frame = pad.peek_buffer().and_then(|b| {
-                // Gap buffers
-                if b.size() == 0 {
-                    pad.drop_buffer();
-                    return None;
-                }
-                let pts = b.pts().unwrap();
-                let pts_end = if let Some(duration) = b.duration() {
-                    pts + duration
-                } else {
-                    pts
-                };
-
-                let running_time = segment.to_running_time(pts).unwrap();
-                let running_time_end = segment.to_running_time(pts_end).unwrap();
-                let frame = gst_video::VideoFrame::from_buffer_readable(b, info).unwrap();
-
-                Some(PadCurrentFrame {
-                    frame,
-                    converted_frame: None,
-                    start_time: running_time,
-                    end_time: running_time_end,
-                    is_repeat: false,
-                })
-            });
-
             if !pad.is_eos() {
                 all_eos = false;
             }
 
-            if let Some(ref next) = next_frame {
+            let mut have_next_frame = false;
+            let mut dropped_old_frame = false;
+
+            loop {
+                let next_frame = pad.peek_buffer().and_then(|b| {
+                    // Gap buffers
+                    if b.size() == 0 {
+                        pad.drop_buffer();
+                        return None;
+                    }
+                    let pts = b.pts().unwrap();
+                    let pts_end = if let Some(duration) = b.duration() {
+                        pts + duration
+                    } else {
+                        pts
+                    };
+
+                    let running_time = segment.to_running_time(pts).unwrap();
+                    let running_time_end = segment.to_running_time(pts_end).unwrap();
+                    let frame = gst_video::VideoFrame::from_buffer_readable(b, info).unwrap();
+
+                    Some(PadCurrentFrame {
+                        frame,
+                        converted_frame: None,
+                        start_time: running_time,
+                        end_time: running_time_end,
+                        is_repeat: false,
+                    })
+                });
+
+                let Some(ref next) = next_frame else {
+                    if dropped_old_frame && !pad.is_eos() {
+                        need_wait = true;
+                    }
+                    break;
+                };
+
                 gst::trace!(
                     CAT,
                     obj = pad,
@@ -265,6 +275,8 @@ impl CustomCompositor {
                     );
                     *current_frame = next_frame;
                     pad.drop_buffer();
+                    have_next_frame = true;
+                    break;
                 } else if next.start_time >= end_time {
                     if let Some(ref current) = current_frame {
                         gst::debug!(
@@ -285,19 +297,23 @@ impl CustomCompositor {
                             next.end_time
                         );
                     }
+                    have_next_frame = true;
+                    break;
                 } else {
                     gst::debug!(
                         CAT,
                         obj = pad,
-                        "Taking next buffer {}-{} but waiting",
+                        "Dropping old buffer {}-{}",
                         next.start_time,
                         next.end_time
                     );
                     *current_frame = next_frame;
                     pad.drop_buffer();
-                    need_wait = true;
+                    dropped_old_frame = true;
                 }
-            } else {
+            }
+
+            if !have_next_frame {
                 if let Some(current) = current_frame {
                     // When a pad is marked to repeat black on EOS, we substitute the current frame
                     // with a black one, which we never time out (is_repeat = true).
