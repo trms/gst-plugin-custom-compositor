@@ -1450,7 +1450,20 @@ impl AggregatorPadImpl for CustomCompositorPad {
         };
 
         let out_running_time = src_segment.to_running_time(position).unwrap();
-        let buffer_running_time = sink_segment.to_running_time(end_pts).unwrap();
+        let buffer_running_time = match sink_segment.to_running_time(end_pts) {
+            Some(running_time) => running_time,
+            None => {
+                gst::debug!(
+                    CAT,
+                    imp = self,
+                    "Drop out of segment buffer, segment {:?}, buffer {:?}",
+                    sink_segment,
+                    buf
+                );
+
+                return true;
+            }
+        };
 
         if buffer_running_time < out_running_time {
             gst::debug!(
